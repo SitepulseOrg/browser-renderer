@@ -1,11 +1,10 @@
-// server.js
+import crypto from 'node:crypto';
 import express from 'express';
 import puppeteer from 'puppeteer';
 
 import { renderPage, runLighthouse } from './browser-tasks.js';
 
 const PORT = 3000;
-const TOKEN = process.env.RENDER_TOKEN;
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '40');
 const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
 const LIGHTHOUSE_TIMEOUT_MS = normalizeLighthouseTimeout(process.env.LIGHTHOUSE_TIMEOUT_MS || '120000');
@@ -13,175 +12,200 @@ const BROWSER_MAX_RENDERS = parseInt(process.env.BROWSER_MAX_RENDERS || '1000');
 const BROWSER_MAX_AGE_MS = parseInt(process.env.BROWSER_MAX_AGE_MS || `${60 * 60 * 1000}`);
 const DEFAULT_WAIT_UNTIL = 'networkidle2';
 
-let browser;
-let browserStartedAt = 0;
-let browserRenders = 0;
-let active = 0;
-let browserUsers = 0;
-let shuttingDown = false;
-let browserLaunchPromise;
-let lighthouseActive = false;
+export function createApp(options = {}) {
+  const token = options.token ?? process.env.RENDER_TOKEN;
+  const maxResponseBytes = Number(options.maxResponseBytes ?? process.env.MAX_RESPONSE_BYTES ?? 5_500_000);
+  let browser;
+  let browserStartedAt = 0;
+  let browserRenders = 0;
+  let active = 0;
+  let browserUsers = 0;
+  let shuttingDown = false;
+  let browserLaunchPromise;
+  let lighthouseActive = false;
 
-async function getBrowser() {
-  const tooOld = browserStartedAt > 0 && (Date.now() - browserStartedAt > BROWSER_MAX_AGE_MS);
-  const tooManyRenders = browserRenders >= BROWSER_MAX_RENDERS;
+  async function getBrowser() {
+    const tooOld = browserStartedAt > 0 && (Date.now() - browserStartedAt > BROWSER_MAX_AGE_MS);
+    const tooManyRenders = browserRenders >= BROWSER_MAX_RENDERS;
 
-  if (browser?.connected && !tooOld && !tooManyRenders && !browserLaunchPromise) {
-    return leaseBrowser(browser);
+    if (browser?.connected && !tooOld && !tooManyRenders && !browserLaunchPromise) {
+      return leaseBrowser(browser);
+    }
+
+    if (!browserLaunchPromise) {
+      browserLaunchPromise = launchBrowser().finally(() => {
+        browserLaunchPromise = undefined;
+      });
+    }
+
+    return leaseBrowser(await browserLaunchPromise);
   }
 
-  if (!browserLaunchPromise) {
-    browserLaunchPromise = launchBrowser().finally(() => {
-      browserLaunchPromise = undefined;
+  function leaseBrowser(activeBrowser) {
+    browserUsers++;
+
+    return {
+      browser: activeBrowser,
+      release() {
+        browserUsers--;
+      },
+    };
+  }
+
+  async function launchBrowser() {
+    while (browser && browserUsers > 0) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+
+    if (browser) {
+      try { await browser.close(); } catch {}
+      browser = undefined;
+    }
+
+    browser = await launchChrome();
+    browserStartedAt = Date.now();
+    browserRenders = 0;
+    return browser;
+  }
+
+  function launchChrome() {
+    return puppeteer.launch({
+      headless: true,
+      ignoreHTTPSErrors: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+      ],
     });
   }
 
-  return leaseBrowser(await browserLaunchPromise);
-}
-
-function leaseBrowser(activeBrowser) {
-  browserUsers++;
-
-  return {
-    browser: activeBrowser,
-    release() {
-      browserUsers--;
-    },
-  };
-}
-
-async function launchBrowser() {
-  while (browser && browserUsers > 0) {
-    await new Promise(r => setTimeout(r, 100));
-  }
-
-  if (browser) {
-    try { await browser.close(); } catch {}
-    browser = undefined;
-  }
-
-  browser = await launchChrome();
-  browserStartedAt = Date.now();
-  browserRenders = 0;
-  return browser;
-}
-
-function launchChrome() {
-  return puppeteer.launch({
-    headless: true,
-    ignoreHTTPSErrors: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-    ],
+  const app = express();
+  app.use(['/content', '/lighthouse'], (req, res, next) => {
+    if (shuttingDown) return res.status(503).json({ error: 'shutting down' });
+    if (!token) return res.status(500).json({ error: 'renderer token not configured' });
+    const actual = Buffer.from(req.headers.authorization ?? '');
+    const expected = Buffer.from(`Bearer ${token}`);
+    if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    next();
   });
-}
+  app.use(express.json({ limit: '1mb' }));
 
-const app = express();
-app.use(express.json({ limit: '1mb' }));
-
-app.get('/healthz', async (_, res) => {
-  const alive = browser?.connected === true;
-  res.status(alive ? 200 : 503).json({
-    ok: alive,
-    active,
-    browserUsers,
-    renders: browserRenders,
-    uptimeMs: browser ? Date.now() - browserStartedAt : 0,
+  app.get('/healthz', async (_, res) => {
+    const ready = !shuttingDown && Boolean(token);
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      browserConnected: browser?.connected === true,
+      active,
+      browserUsers,
+      renders: browserRenders,
+      uptimeMs: browser ? Date.now() - browserStartedAt : 0,
+    });
   });
-});
 
-app.post('/content', async (req, res) => {
-  if (shuttingDown) return res.status(503).json({ error: 'shutting down' });
-  if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  if (active >= MAX_CONCURRENT) {
-    return res.status(503).json({ error: 'overloaded', retryAfter: 1 });
-  }
-  const { url, waitUntil = DEFAULT_WAIT_UNTIL, timeout = NAV_TIMEOUT_MS, userAgent } = req.body || {};
-  const validatedUrl = validateUrl(url);
-  if (!validatedUrl.ok) return res.status(400).json({ error: validatedUrl.error });
+  app.post('/content', async (req, res) => {
+    if (active >= MAX_CONCURRENT) {
+      return res.status(503).json({ error: 'overloaded', retryAfter: 1 });
+    }
+    const { url, waitUntil = DEFAULT_WAIT_UNTIL, timeout = NAV_TIMEOUT_MS, userAgent } = req.body || {};
+    const validatedUrl = validateUrl(url);
+    if (!validatedUrl.ok) return res.status(400).json({ error: validatedUrl.error });
 
-  active++;
-  let browserLease;
-  try {
-    browserLease = await getBrowser();
-    const b = browserLease.browser;
-    browserRenders++;
-    const content = await renderPage(await b.newPage(), validatedUrl.url, {
-      waitUntil,
-      timeout: normalizeTimeout(timeout),
-      userAgent,
-    });
-    res.json({ content });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    if (browserLease) browserLease.release();
-    active--;
-  }
-});
+    active++;
+    try {
+      const content = await (options.renderUrl ?? defaultRenderUrl)(validatedUrl.url, {
+        waitUntil,
+        timeout: normalizeTimeout(timeout),
+        userAgent,
+      });
+      const payload = { content };
+      const responseBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+      if (responseBytes > maxResponseBytes) {
+        return res.status(502).json({ error: 'rendered content too large', responseBytes, maxResponseBytes });
+      }
+      res.json(payload);
+    } catch (e) {
+      res.status(500).json({ error: String(e.message || e) });
+    } finally {
+      active--;
+    }
+  });
 
-app.post('/lighthouse', async (req, res) => {
-  if (shuttingDown) return res.status(503).json({ error: 'shutting down' });
-  if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
-  if (lighthouseActive) {
-    return res.status(503).json({ error: 'lighthouse already running', retryAfter: 1 });
+  async function defaultRenderUrl(url, settings) {
+    const lease = await getBrowser();
+    try {
+      browserRenders++;
+      return await renderPage(await lease.browser.newPage(), url, settings);
+    } finally {
+      lease.release();
+    }
   }
 
-  const validatedUrl = validateUrl(req.body?.url);
-  if (!validatedUrl.ok) return res.status(400).json({ error: validatedUrl.error });
+  app.post('/lighthouse', async (req, res) => {
+    if (lighthouseActive) {
+      return res.status(503).json({ error: 'lighthouse already running', retryAfter: 1 });
+    }
 
-  active++;
-  lighthouseActive = true;
-  const startedAt = Date.now();
+    const validatedUrl = validateUrl(req.body?.url);
+    if (!validatedUrl.ok) return res.status(400).json({ error: validatedUrl.error });
 
-  try {
-    browserRenders++;
-    const lighthouseResult = await runLighthouse(validatedUrl.url, {
-      launchBrowser: launchChrome,
-      timeoutMs: LIGHTHOUSE_TIMEOUT_MS,
-    });
+    active++;
+    lighthouseActive = true;
+    const startedAt = Date.now();
 
-    res.json({
-      lighthouseResult,
-      durationMs: Date.now() - startedAt,
-      source: 'browser-renderer',
-    });
-  } catch (e) {
-    res.status(e?.code === 'ETIMEDOUT' ? 504 : 500).json({ error: String(e.message || e) });
-  } finally {
-    lighthouseActive = false;
-    active--;
+    try {
+      browserRenders++;
+      const lighthouseResult = await (options.lighthouseRunner ?? runLighthouse)(validatedUrl.url, {
+        launchBrowser: launchChrome,
+        timeoutMs: options.lighthouseTimeoutMs ?? LIGHTHOUSE_TIMEOUT_MS,
+      });
+
+      delete lighthouseResult.fullPageScreenshot;
+      delete lighthouseResult.audits?.['screenshot-thumbnails'];
+      delete lighthouseResult.audits?.['final-screenshot'];
+
+      res.json({
+        lighthouseResult,
+        durationMs: Date.now() - startedAt,
+        source: 'browser-renderer',
+      });
+    } catch (e) {
+      res.status(e?.code === 'ETIMEDOUT' ? 504 : 500).json({ error: String(e.message || e) });
+    } finally {
+      lighthouseActive = false;
+      active--;
+    }
+  });
+
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('shutting down...');
+    const deadline = Date.now() + Math.max(NAV_TIMEOUT_MS, options.lighthouseTimeoutMs ?? LIGHTHOUSE_TIMEOUT_MS) + 5_000;
+    while (active > 0 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (browser) { try { await browser.close(); } catch {} }
   }
-});
-
-async function shutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log('shutting down...');
-  const deadline = Date.now() + 30_000;
-  while (active > 0 && Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 200));
-  }
-  if (browser) { try { await browser.close(); } catch {} }
-  process.exit(0);
+  app.locals.shutdown = shutdown;
+  return app;
 }
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
 
-app.listen(PORT, '0.0.0.0', () => console.log(`render up on :${PORT}`));
+if (import.meta.main) {
+  const app = createApp();
+  process.on('SIGTERM', async () => { await app.locals.shutdown(); process.exit(0); });
+  process.on('SIGINT', async () => { await app.locals.shutdown(); process.exit(0); });
+  app.listen(PORT, '0.0.0.0', () => console.log(`render up on :${PORT}`));
+}
 
 function validateUrl(url) {
   if (typeof url !== 'string' || url.trim() === '') {

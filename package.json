@@ -6,15 +6,12 @@
   "scripts": {
     "start": "node server.js",
     "loadtest": "node scripts/loadtest.js",
-    "test": "node --test",
-    "smoke:lambda": "node scripts/smoke-lambda.js"
+    "test": "node --test"
   },
   "dependencies": {
-    "@sparticuz/chromium": "^149.0.0",
     "express": "^4.21.2",
     "lighthouse": "^13.4.0",
-    "puppeteer": "^23.11.1",
-    "puppeteer-core": "^25.1.0"
+    "puppeteer": "^23.11.1"
   },
   "devDependencies": {
     "autocannon": "^7.15.0"

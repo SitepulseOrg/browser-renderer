@@ -32,6 +32,7 @@ export async function runLighthouse(url, { launchBrowser, timeoutMs, settings = 
   let expired = false;
 
   const work = (async () => {
+    const { default: desktopConfig } = await import('lighthouse/core/config/desktop-config.js');
     const lighthouse = lighthouseRunner ?? (await import('lighthouse')).default;
     if (expired) return;
 
@@ -50,7 +51,7 @@ export async function runLighthouse(url, { launchBrowser, timeoutMs, settings = 
       port,
       ...settings,
       disableFullPageScreenshot: true,
-    });
+    }, desktopConfig);
   })();
 
   try {

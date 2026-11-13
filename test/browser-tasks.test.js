@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { initializeConfig } from 'lighthouse/core/config/config.js';
 
 import { renderPage, runLighthouse } from '../browser-tasks.js';
 
@@ -97,17 +98,18 @@ test('closes the page when HTML extraction fails and preserves the error', async
   assert.equal(closed, true);
 });
 
-test('runs Lighthouse without full-page screenshots and closes its browser', async () => {
+test('runs a cold desktop Lighthouse benchmark without full-page screenshots and closes its browser', async () => {
   let closed = false;
+  let resolvedSettings;
   const lhr = { categories: { performance: { score: 0.9 } } };
   const result = await runLighthouse('https://example.com', {
     launchBrowser: async () => browser(async () => { closed = true; }),
     timeoutMs: 1_000,
-    settings: { formFactor: 'desktop' },
-    lighthouseRunner: async (url, flags) => {
+    lighthouseRunner: async (url, flags, config) => {
       assert.equal(url, 'https://example.com');
       assert.equal(flags.disableFullPageScreenshot, true);
-      assert.equal(flags.formFactor, 'desktop');
+      const { resolvedConfig } = await initializeConfig('navigation', config, flags);
+      resolvedSettings = resolvedConfig.settings;
       assert.deepEqual(flags.onlyCategories, ['performance']);
       assert.equal(flags.port, 9222);
       return { lhr };
@@ -116,6 +118,13 @@ test('runs Lighthouse without full-page screenshots and closes its browser', asy
 
   assert.deepEqual(result, lhr);
   assert.equal(closed, true);
+  assert.equal(resolvedSettings.formFactor, 'desktop');
+  assert.equal(resolvedSettings.screenEmulation.mobile, false);
+  assert.equal(resolvedSettings.throttlingMethod, 'simulate');
+  assert.equal(resolvedSettings.throttling.rttMs, 40);
+  assert.equal(resolvedSettings.throttling.throughputKbps, 10_240);
+  assert.equal(resolvedSettings.throttling.cpuSlowdownMultiplier, 1);
+  assert.equal(resolvedSettings.disableStorageReset, false);
 });
 
 test('Lighthouse timeout waits for browser closure and runner cleanup', { timeout: 1_000 }, async () => {

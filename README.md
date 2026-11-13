@@ -32,7 +32,7 @@ Body params:
 
 ### `POST /lighthouse`
 
-Runs Lighthouse against a URL and returns the raw Lighthouse result.
+Runs Lighthouse with the standard simulated desktop profile and a fresh browser. Returns the Lighthouse result with diagnostics, excluding screenshot blobs.
 
 ```bash
 curl -X POST http://localhost:3000/lighthouse \
@@ -49,7 +49,7 @@ Response:
 
 ### `GET /healthz`
 
-Returns 200 when browser is alive, 503 otherwise. Includes `active`, `renders`, `uptimeMs`.
+Returns 200 when the service is ready, including before the first render; returns 503 during shutdown or when `RENDER_TOKEN` is missing. Includes `browserConnected`, `active`, `renders`, and `uptimeMs`.
 
 ## Performance defaults
 
@@ -58,7 +58,7 @@ Returns 200 when browser is alive, 503 otherwise. Includes `active`, `renders`, 
 - Auto-recycle Chrome after `BROWSER_MAX_RENDERS` (default 1000) or `BROWSER_MAX_AGE_MS` (default 1 hour) — prevents memory leaks
 - Aborts image / media / font / stylesheet requests by default — link extraction doesn't need them, ~3–5× faster
 - `MAX_CONCURRENT` semaphore returns 503 instead of OOMing when overloaded
-- Graceful SIGTERM: drains in-flight requests up to 30s before closing browser
+- Graceful SIGTERM: drains in-flight requests through the configured audit timeout before closing the browser
 
 ## Environment variables
 
@@ -66,16 +66,19 @@ See `.env.example`. Copy to `.env` before booting.
 
 | Var                     | Default     | Description                                                |
 |-------------------------|-------------|------------------------------------------------------------|
-| `RENDER_TOKEN`          | (unset)     | Bearer token. If unset, endpoint is open. **Always set in prod.** |
+| `RENDER_TOKEN`          | (unset)     | Required bearer token; requests fail if it is unset. |
 | `MAX_CONCURRENT`        | `40`        | Hard cap on parallel renders                               |
 | `NAV_TIMEOUT_MS`        | `30000`     | Default goto timeout                                       |
 | `LIGHTHOUSE_TIMEOUT_MS` | `120000`    | Lighthouse runner timeout                                  |
+| `MAX_RESPONSE_BYTES` | `5500000` | Maximum rendered HTML JSON response size |
 | `BROWSER_MAX_RENDERS`   | `1000`      | Recycle Chrome after N renders                             |
 | `BROWSER_MAX_AGE_MS`    | `3600000`   | Recycle Chrome after N ms uptime                           |
 
 ## Local dev
 
 ```bash
+cp .env.example .env
+# Set RENDER_TOKEN in .env before starting.
 docker compose up --build
 curl http://localhost:3000/healthz
 ```
@@ -96,6 +99,7 @@ Render service must NOT be public. Two options:
 
 **Option A — Hetzner private network (recommended):**
 - Attach Sitepulse app server + render server to the same Hetzner private network
+- Change the port binding from `127.0.0.1:3000:3000` to the renderer's private IP, such as `10.0.0.2:3000:3000`
 - In Ploi → Server → Firewall: allow port `3000` only from the app server's private IP
 - Sitepulse calls `http://<render-private-ip>:3000`
 
@@ -103,6 +107,8 @@ Render service must NOT be public. Two options:
 - Install `cloudflared` on the render box, route `render.yourdomain.com` → `localhost:3000`
 - Block port 3000 in Ploi firewall entirely
 - Add Cloudflare Access policy on the hostname for double auth
+
+Enable the optional tunnel with `docker compose --profile tunnel up -d --build`. Otherwise, proxy the renderer's loopback port through Ploi.
 
 Either way: `RENDER_TOKEN` is **mandatory** as second factor.
 
@@ -133,56 +139,6 @@ Watch:
 - `non2xx` — should be near zero (503s = you exceeded `MAX_CONCURRENT`)
 - p99 latency — should be under your `NAV_TIMEOUT_MS`
 - `docker stats` in another terminal — memory/CPU under load
-
-## AWS speed profile
-
-The Lambda deployment is tuned for the kind of AWS credits where speed matters more
-than squeezing every cent:
-
-- `FunctionMemorySize=3008` by default. Lambda allocates CPU with memory, so Chromium
-  usually navigates and serializes faster near 3 GB than at 2 GB.
-- `ProvisionedConcurrentExecutions=0` by default. At low volume this avoids a
-  steady monthly warm-capacity charge; set it to `1` only if first-render latency
-  matters.
-- `EphemeralStorage=2048` gives Chromium more scratch space without changing the
-  code path.
-- `BROWSER_MAX_RENDERS=250` and `BROWSER_MAX_AGE_MS=3600000` keep warm browsers
-  useful for longer while still recycling them before leaks accumulate.
-
-Deploy a faster baseline:
-
-```bash
-sam deploy \
-  --parameter-overrides \
-    RenderToken="$RENDER_TOKEN" \
-    FunctionMemorySize=3008 \
-    ProvisionedConcurrentExecutions=0 \
-    BrowserMaxRenders=250 \
-    BrowserMaxAgeMs=3600000
-```
-
-For user-facing checks where cold starts are painful, try
-`ProvisionedConcurrentExecutions=1`. For bursty checks, try `2` or `3`.
-Provisioned concurrency is the one setting here that creates a steady hourly
-cost, so keep it at `0` for low-volume background rendering.
-
-Quick comparison loop against the Lambda Function URL:
-
-```bash
-for c in 1 2 5 10; do
-  RENDER_URL="$BROWSER_RENDERER_URL" \
-  RENDER_TOKEN="$RENDER_TOKEN" \
-  TARGET_URL=https://example.com \
-  CONCURRENCY="$c" \
-  DURATION=45 \
-  npm run loadtest
-done
-```
-
-Use the same target URL when comparing memory sizes. Watch CloudWatch `Duration`,
-`InitDuration`, `Throttles`, `ConcurrentExecutions`, and `ProvisionedConcurrencyUtilization`.
-The sweet spot is the smallest memory size where p95 stops materially improving
-and warm concurrency utilization stays below about 70%.
 
 ## Scaling out
 

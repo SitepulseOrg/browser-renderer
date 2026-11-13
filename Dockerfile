@@ -1,12 +1,18 @@
-FROM ghcr.io/puppeteer/puppeteer:23
+FROM node:24-bookworm-slim
 
-WORKDIR /home/pptruser/app
+WORKDIR /home/node/app
 
-COPY --chown=pptruser:pptruser package.json package-lock.json* ./
-RUN npm ci --omit=dev || npm install --omit=dev
+ENV PUPPETEER_CACHE_DIR=/home/node/.cache/puppeteer
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev \
+    && apt-get update \
+    && npx puppeteer browsers install chrome --install-deps \
+    && chown -R node:node /home/node/.cache
 
-COPY --chown=pptruser:pptruser server.js browser-tasks.js ./
+COPY --chown=node:node server.js browser-tasks.js ./
 
 ENV NODE_ENV=production
+USER node
 EXPOSE 3000
 CMD ["node", "server.js"]
