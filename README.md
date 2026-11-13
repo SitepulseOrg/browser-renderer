@@ -53,7 +53,7 @@ Returns 200 when browser is alive, 503 otherwise. Includes `active`, `renders`, 
 
 ## Performance defaults
 
-- Single shared Chrome instance, fresh page per request
+- Shared Chrome instance for `/content`, fresh page per request; Lighthouse uses a dedicated browser per audit so timeout cleanup cannot interrupt HTML renders
 - Browser leases prevent Chrome recycling while a request is opening or using a page
 - Auto-recycle Chrome after `BROWSER_MAX_RENDERS` (default 1000) or `BROWSER_MAX_AGE_MS` (default 1 hour) — prevents memory leaks
 - Aborts image / media / font / stylesheet requests by default — link extraction doesn't need them, ~3–5× faster

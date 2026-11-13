@@ -1,18 +1,17 @@
 // server.js
 import express from 'express';
-import lighthouse from 'lighthouse';
 import puppeteer from 'puppeteer';
+
+import { renderPage, runLighthouse } from './browser-tasks.js';
 
 const PORT = 3000;
 const TOKEN = process.env.RENDER_TOKEN;
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '40');
 const NAV_TIMEOUT_MS = parseInt(process.env.NAV_TIMEOUT_MS || '30000');
-const PAGE_CONTENT_TIMEOUT_MS = 5_000;
 const LIGHTHOUSE_TIMEOUT_MS = normalizeLighthouseTimeout(process.env.LIGHTHOUSE_TIMEOUT_MS || '120000');
 const BROWSER_MAX_RENDERS = parseInt(process.env.BROWSER_MAX_RENDERS || '1000');
 const BROWSER_MAX_AGE_MS = parseInt(process.env.BROWSER_MAX_AGE_MS || `${60 * 60 * 1000}`);
 const DEFAULT_WAIT_UNTIL = 'networkidle2';
-const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font', 'stylesheet']);
 
 let browser;
 let browserStartedAt = 0;
@@ -61,7 +60,14 @@ async function launchBrowser() {
     browser = undefined;
   }
 
-  browser = await puppeteer.launch({
+  browser = await launchChrome();
+  browserStartedAt = Date.now();
+  browserRenders = 0;
+  return browser;
+}
+
+function launchChrome() {
+  return puppeteer.launch({
     headless: true,
     ignoreHTTPSErrors: true,
     args: [
@@ -77,9 +83,6 @@ async function launchBrowser() {
       '--disable-renderer-backgrounding',
     ],
   });
-  browserStartedAt = Date.now();
-  browserRenders = 0;
-  return browser;
 }
 
 const app = express();
@@ -109,34 +112,20 @@ app.post('/content', async (req, res) => {
   if (!validatedUrl.ok) return res.status(400).json({ error: validatedUrl.error });
 
   active++;
-  let page;
   let browserLease;
   try {
     browserLease = await getBrowser();
     const b = browserLease.browser;
-    page = await b.newPage();
     browserRenders++;
-    if (userAgent) await page.setUserAgent(userAgent);
-
-    await page.setRequestInterception(true);
-    page.on('request', r => {
-      try {
-        if (BLOCKED_RESOURCE_TYPES.has(r.resourceType())) {
-          return r.abort();
-        }
-        r.continue();
-      } catch { /* request already handled */ }
+    const content = await renderPage(await b.newPage(), validatedUrl.url, {
+      waitUntil,
+      timeout: normalizeTimeout(timeout),
+      userAgent,
     });
-
-    await page.goto(validatedUrl.url, { waitUntil, timeout: normalizeTimeout(timeout) });
-    const content = await page.content({ timeout: PAGE_CONTENT_TIMEOUT_MS });
     res.json({ content });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   } finally {
-    if (page) {
-      try { await page.close(); } catch {}
-    }
     if (browserLease) browserLease.release();
     active--;
   }
@@ -156,36 +145,23 @@ app.post('/lighthouse', async (req, res) => {
 
   active++;
   lighthouseActive = true;
-  let browserLease;
   const startedAt = Date.now();
 
   try {
-    browserLease = await getBrowser();
     browserRenders++;
-
-    const result = await withTimeout(
-      lighthouse(validatedUrl.url, {
-        logLevel: 'error',
-        maxWaitForLoad: LIGHTHOUSE_TIMEOUT_MS,
-        onlyCategories: ['performance'],
-        output: 'json',
-        port: getBrowserDebugPort(browserLease.browser),
-      }),
-      LIGHTHOUSE_TIMEOUT_MS,
-      'lighthouse timed out',
-    );
-
-    if (!result?.lhr) throw new Error('lighthouse did not return a result');
+    const lighthouseResult = await runLighthouse(validatedUrl.url, {
+      launchBrowser: launchChrome,
+      timeoutMs: LIGHTHOUSE_TIMEOUT_MS,
+    });
 
     res.json({
-      lighthouseResult: result.lhr,
+      lighthouseResult,
       durationMs: Date.now() - startedAt,
       source: 'browser-renderer',
     });
   } catch (e) {
     res.status(e?.code === 'ETIMEDOUT' ? 504 : 500).json({ error: String(e.message || e) });
   } finally {
-    if (browserLease) browserLease.release();
     lighthouseActive = false;
     active--;
   }
@@ -239,33 +215,4 @@ function normalizeLighthouseTimeout(timeout) {
   const parsed = Number.parseInt(timeout, 10);
 
   return Number.isNaN(parsed) || parsed <= 0 ? 120_000 : parsed;
-}
-
-async function withTimeout(promise, timeoutMs, message) {
-  let timer;
-
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          const error = new Error(message);
-          error.code = 'ETIMEDOUT';
-          reject(error);
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function getBrowserDebugPort(activeBrowser) {
-  const port = Number.parseInt(new URL(activeBrowser.wsEndpoint()).port, 10);
-
-  if (Number.isNaN(port)) {
-    throw new Error('browser debug port unavailable');
-  }
-
-  return port;
 }

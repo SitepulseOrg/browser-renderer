@@ -1,11 +1,11 @@
 import crypto from 'node:crypto';
 
 import chromium from '@sparticuz/chromium';
-import lighthouse from 'lighthouse';
 import puppeteer from 'puppeteer-core';
 
+import { renderPage, runLighthouse } from '../browser-tasks.js';
+
 const DEFAULT_NAV_TIMEOUT_MS = 30_000;
-const DEFAULT_PAGE_CONTENT_TIMEOUT_MS = 5_000;
 const DEFAULT_WAIT_UNTIL = 'networkidle2';
 const DEFAULT_MAX_RESPONSE_BYTES = 5_500_000;
 const DEFAULT_BROWSER_MAX_RENDERS = 100;
@@ -40,7 +40,6 @@ const DEFAULT_VIEWPORT = {
   isMobile: false,
   width: 1920,
 };
-const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font', 'stylesheet']);
 
 let browser;
 let browserStartedAt = 0;
@@ -160,15 +159,12 @@ async function handleLighthouseRequest(url, options) {
   lighthouseActive = true;
 
   try {
-    const lighthouseRunner = options.lighthouseRunner ?? defaultRunLighthouse;
-    const lighthouseResult = stripLighthouseScreenshots(await withTimeout(
-      lighthouseRunner(url, {
-        settings: LIGHTHOUSE_DESKTOP_SETTINGS,
-        timeoutMs,
-      }),
+    const lighthouseRunner = options.lighthouseRunner ?? runLighthouse;
+    const lighthouseResult = stripLighthouseScreenshots(await lighthouseRunner(url, {
+      launchBrowser: launchLighthouseBrowser,
+      settings: LIGHTHOUSE_DESKTOP_SETTINGS,
       timeoutMs,
-      'lighthouse timed out',
-    ));
+    }));
     const durationMs = Date.now() - startedAt;
 
     log('lighthouse_success', { url, durationMs });
@@ -191,74 +187,11 @@ async function handleLighthouseRequest(url, options) {
   }
 }
 
-async function defaultRunLighthouse(url, { settings, timeoutMs }) {
-  const activeBrowser = await launchLighthouseBrowser();
-  browserRenders++;
-
-  try {
-    const result = await lighthouse(url, {
-      logLevel: 'error',
-      maxWaitForLoad: timeoutMs,
-      onlyCategories: ['performance'],
-      output: 'json',
-      port: getBrowserDebugPort(activeBrowser),
-      ...settings,
-    });
-
-    if (!result?.lhr) {
-      throw new Error('lighthouse did not return a result');
-    }
-
-    return result.lhr;
-  } finally {
-    try {
-      await activeBrowser.close();
-    } catch {
-      // Lighthouse gets a fresh browser, so close failures should not hide the result.
-    }
-  }
-}
-
-async function defaultRenderUrl(url, { waitUntil, timeout, userAgent }) {
+async function defaultRenderUrl(url, options) {
   const activeBrowser = await getBrowser();
   browserRenders++;
 
-  let page;
-
-  try {
-    page = await activeBrowser.newPage();
-
-    if (userAgent) {
-      await page.setUserAgent(userAgent);
-    }
-
-    await page.setRequestInterception(true);
-    page.on('request', request => {
-      try {
-        if (BLOCKED_RESOURCE_TYPES.has(request.resourceType())) {
-          request.abort();
-
-          return;
-        }
-
-        request.continue();
-      } catch {
-        // Puppeteer may emit late request events during page shutdown.
-      }
-    });
-
-    await page.goto(url, { waitUntil, timeout });
-
-    return await page.content({ timeout: DEFAULT_PAGE_CONTENT_TIMEOUT_MS });
-  } finally {
-    if (page) {
-      try {
-        await page.close();
-      } catch {
-        // Closing failures should not mask the render result.
-      }
-    }
-  }
+  return renderPage(await activeBrowser.newPage(), url, options);
 }
 
 async function getBrowser() {
@@ -311,12 +244,15 @@ async function launchBrowser() {
 }
 
 async function launchLighthouseBrowser() {
-  return puppeteer.launch({
+  const activeBrowser = await puppeteer.launch({
     args: await lighthouseChromeArgs(),
     executablePath: await chromium.executablePath(),
     headless: 'shell',
     ignoreHTTPSErrors: true,
   });
+  browserRenders++;
+
+  return activeBrowser;
 }
 
 async function lighthouseChromeArgs() {
@@ -411,35 +347,6 @@ function normalizeLighthouseTimeout(timeout) {
   const parsed = Number.parseInt(timeout, 10);
 
   return Number.isNaN(parsed) || parsed <= 0 ? DEFAULT_LIGHTHOUSE_TIMEOUT_MS : parsed;
-}
-
-async function withTimeout(promise, timeoutMs, message) {
-  let timer;
-
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          const error = new Error(message);
-          error.code = 'ETIMEDOUT';
-          reject(error);
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function getBrowserDebugPort(activeBrowser) {
-  const port = Number.parseInt(new URL(activeBrowser.wsEndpoint()).port, 10);
-
-  if (Number.isNaN(port)) {
-    throw new Error('browser debug port unavailable');
-  }
-
-  return port;
 }
 
 function getMethod(event) {

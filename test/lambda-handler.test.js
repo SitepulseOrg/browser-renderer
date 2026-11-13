@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { handleEvent } from '../lambda/handler.js';
+import { runLighthouse } from '../browser-tasks.js';
 
 const token = 'test-token';
 
@@ -194,19 +196,50 @@ test('strips lighthouse screenshot blobs from the response', async () => {
   assert.equal(body.lighthouseResult.categories.performance.score, 0.91);
 });
 
-test('returns safe json when lighthouse times out', async () => {
-  const response = await handleEvent(event({
+test('keeps Lighthouse busy until timeout cleanup finishes, then accepts another audit', { timeout: 1_000 }, async () => {
+  const work = Promise.withResolvers();
+  const closing = Promise.withResolvers();
+  const finishClosing = Promise.withResolvers();
+  const request = event({
     path: '/lighthouse',
     body: { url: 'https://example.com' },
     headers: authHeaders(),
-  }), {
+  });
+  const pendingResponse = handleEvent(request, {
     token,
     lighthouseTimeoutMs: 1,
-    lighthouseRunner: async () => new Promise(() => {}),
+    lighthouseRunner: (url, options) => runLighthouse(url, {
+      ...options,
+      launchBrowser: async () => ({
+        wsEndpoint: () => 'ws://127.0.0.1:9222/browser/test',
+        close: async () => {
+          closing.resolve();
+          await finishClosing.promise;
+          work.reject(new Error('browser closed'));
+        },
+      }),
+      lighthouseRunner: () => work.promise,
+    }),
   });
 
+  await closing.promise;
+  let nextRuns = 0;
+  const nextOptions = {
+    token,
+    lighthouseRunner: async () => { nextRuns++; return { categories: {} }; },
+  };
+  const busyResponse = await handleEvent(request, nextOptions);
+  assert.equal(busyResponse.statusCode, 503);
+  assert.equal(nextRuns, 0);
+
+  finishClosing.resolve();
+  const response = await pendingResponse;
   assert.equal(response.statusCode, 504);
   assert.deepEqual(JSON.parse(response.body), { error: 'lighthouse timed out' });
+
+  const nextResponse = await handleEvent(request, nextOptions);
+  assert.equal(nextResponse.statusCode, 200);
+  assert.equal(nextRuns, 1);
 });
 
 test('returns safe json when lighthouse fails', async () => {
@@ -276,4 +309,26 @@ test('responds to health checks', async () => {
 
   assert.equal(response.statusCode, 200);
   assert.equal(JSON.parse(response.body).ok, true);
+});
+
+test('serves content without loading Lighthouse', () => {
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { registerHooks } from 'node:module';
+    registerHooks({ resolve(specifier, context, nextResolve) {
+      if (specifier === 'lighthouse') throw new Error('Lighthouse loaded on the content path');
+      return nextResolve(specifier, context);
+    } });
+    const { handleEvent } = await import('./lambda/handler.js');
+    const response = await handleEvent(${JSON.stringify(event({
+      body: { url: 'https://example.com' },
+      headers: authHeaders(),
+    }))}, {
+      token: ${JSON.stringify(token)},
+      renderUrl: async () => '<html>rendered</html>',
+    });
+    assert.equal(response.statusCode, 200);
+  `], { cwd: new URL('../', import.meta.url), encoding: 'utf8', timeout: 5_000 });
+
+  assert.equal(result.status, 0, result.stderr);
 });
