@@ -8,6 +8,7 @@ import { renderPage, runLighthouse } from '../browser-tasks.js';
 function page(overrides = {}) {
   return {
     setUserAgent: async () => {},
+    getDefaultNavigationTimeout: () => 30_000,
     setRequestInterception: async () => {},
     on() {},
     goto: async () => {},
@@ -21,6 +22,62 @@ function browser(close) {
   return { wsEndpoint: () => 'ws://127.0.0.1:9222/browser/test', close };
 }
 
+test('waits for actual network idle before reading HTML when Chrome omits navigation-idle events', async () => {
+  for (const [waitUntil, concurrency] of [['networkidle0', 0], ['networkidle2', 2]]) {
+    const idleStarted = Promise.withResolvers();
+    const idleReady = Promise.withResolvers();
+    let extracted = false;
+    let closed = false;
+    const result = renderPage(page({
+      goto: async (_, options) => {
+        if (options.waitUntil.startsWith('networkidle')) {
+          throw new Error('Chrome did not emit a navigation-idle event');
+        }
+      },
+      waitForNetworkIdle: async options => {
+        assert.equal(options.concurrency, concurrency);
+        assert.equal(options.idleTime, 500);
+        assert.ok(options.timeout > 0 && options.timeout <= 1_000);
+        idleStarted.resolve();
+        await idleReady.promise;
+      },
+      content: async () => { extracted = true; return '<html>ready</html>'; },
+      close: async () => { closed = true; },
+    }), 'https://example.com', { waitUntil, timeout: 1_000 });
+
+    await Promise.race([idleStarted.promise, result]);
+    assert.equal(extracted, false);
+    idleReady.resolve();
+    assert.equal(await result, '<html>ready</html>');
+    assert.equal(closed, true);
+  }
+});
+
+test('shares the navigation timeout budget with the idle wait', async t => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  for (const [timeout, elapsed, expected] of [[1_000, 400, 600], [1_000, 1_000, 1], [0, 400, 0], [undefined, 400, 29_600]]) {
+    now = 0;
+    let waited = false;
+    await renderPage(page({
+      goto: async () => { now += elapsed; },
+      waitForNetworkIdle: async options => { waited = true; assert.equal(options.timeout, expected); },
+    }), 'https://example.com', { waitUntil: 'networkidle2', timeout });
+    assert.equal(waited, true);
+  }
+});
+
+test('closes the page and preserves a genuine network idle timeout without returning partial HTML', async () => {
+  let closed = false;
+  const error = new Error('Network idle timeout');
+  await assert.rejects(renderPage(page({
+    waitForNetworkIdle: async () => { throw error; },
+    content: async () => assert.fail('HTML must not be read before the network settles'),
+    close: async () => { closed = true; },
+  }), 'https://example.com', { waitUntil: 'networkidle2', timeout: 1_000 }), error);
+  assert.equal(closed, true);
+});
+
 test('renders HTML with the requested navigation settings and closes the page', async () => {
   let closed = false;
   let requestHandler;
@@ -33,10 +90,10 @@ test('renders HTML with the requested navigation settings and closes the page', 
     },
     goto: async (url, options) => {
       assert.equal(url, 'https://example.com');
-      assert.deepEqual(options, { waitUntil: 'networkidle2', timeout: 30_000 });
+      assert.deepEqual(options, { waitUntil: 'load', timeout: 30_000 });
     },
     close: async () => { closed = true; },
-  }), 'https://example.com', { waitUntil: 'networkidle2', timeout: 30_000, userAgent: 'Sitepulse' });
+  }), 'https://example.com', { waitUntil: 'load', timeout: 30_000, userAgent: 'Sitepulse' });
 
   assert.equal(content, '<html>rendered</html>');
   assert.equal(closed, true);

@@ -16,7 +16,18 @@ export async function renderPage(page, url, { waitUntil, timeout, userAgent, con
       } catch { /* Puppeteer may emit late requests during page shutdown. */ }
     });
 
-    await page.goto(url, { waitUntil, timeout });
+    const networkIdle = waitUntil === 'networkidle0' || waitUntil === 'networkidle2';
+    const navigationTimeout = timeout ?? page.getDefaultNavigationTimeout();
+    const navigationStartedAt = Date.now();
+    await page.goto(url, { waitUntil: networkIdle ? 'domcontentloaded' : waitUntil, timeout });
+    if (networkIdle) {
+      // Chrome can omit navigation-idle events even after all requests have finished.
+      await page.waitForNetworkIdle({
+        concurrency: waitUntil === 'networkidle0' ? 0 : 2,
+        idleTime: 500,
+        timeout: navigationTimeout === 0 ? 0 : Math.max(1, navigationTimeout - (Date.now() - navigationStartedAt)),
+      });
+    }
     content = page.content();
 
     return await withTimeout(content, contentTimeoutMs, 'page content timed out');
